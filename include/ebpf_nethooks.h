@@ -247,6 +247,56 @@ typedef struct _bpf_sock_ops
 typedef int
 sock_ops_hook_t(bpf_sock_ops_t* context);
 
+/**
+ *  @brief TODO TODO Data structure used as context for BPF_PROG_TYPE_CGROUP_SOCK_ADDR program type.
+ */
+typedef struct _bpf_redirect_context
+{
+    uint64_t transport_endpoint_handle; // Identifier for this endpoint
+    // SOCKADDR originalDestination;
+    // uint64_t endpointHandle;
+    uint32_t family; ///< IP address family.
+    struct
+    {
+        /* @brief Original destination IP address in network byte order.
+         */
+        union
+        {
+            uint32_t original_remote_ip4;
+            uint32_t original_remote_ip6[4];
+        };
+        uint16_t original_remote_port; ///< Destination port in network byte order.
+    };
+    // struct
+    // {
+    //     /**
+    //      * @brief Source IP address in network byte order.
+    //      * Local for ingress, remote for egress.
+    //      */
+    //     union
+    //     {
+    //         uint32_t msg_src_ip4;
+    //         uint32_t msg_src_ip6[4];
+    //     };
+    //     uint16_t msg_src_port; ///< Source port in network byte order.
+    // };
+    // struct
+    // {
+    //     /* @brief Destination IP address in network byte order.
+    //      * Local for egress, remote for ingress.
+    //      */
+    //     union
+    //     {
+    //         uint32_t user_ip4;
+    //         uint32_t user_ip6[4];
+    //     };
+    //     uint16_t user_port; ///< Destination port in network byte order.
+    // };
+    // uint32_t protocol;       ///< IP protocol.
+    // uint32_t compartment_id; ///< Network compartment Id.
+    // uint64_t interface_luid; ///< Interface LUID.
+} bpf_redirect_context_t;
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif

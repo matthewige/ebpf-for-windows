@@ -1192,12 +1192,14 @@ _net_ebpf_ext_process_redirect_verdict(
     _In_ const FWPS_FILTER* filter,
     uint64_t classify_handle,
     HANDLE redirect_handle,
+    uint64_t transport_endpoint_handle,
     _Out_ bool* redirected,
     _Inout_ FWPS_CLASSIFY_OUT* classify_output)
 {
     NTSTATUS status = STATUS_SUCCESS;
     FWPS_CONNECT_REQUEST* connect_request = NULL;
     BOOLEAN commit_layer_data = FALSE;
+    bpf_redirect_context_t* redirect_context = NULL;
 
     *redirected = FALSE;
 
@@ -1242,11 +1244,31 @@ _net_ebpf_ext_process_redirect_verdict(
 
         connect_request->localRedirectTargetPID = TARGET_PROCESS_ID;
         connect_request->localRedirectHandle = redirect_handle;
+
+        // Store redirect context containing the original destination
+        redirect_context = (bpf_redirect_context_t*)ExAllocatePoolUninitialized(
+            NonPagedPoolNx, sizeof(bpf_redirect_context_t), NET_EBPF_EXTENSION_POOL_TAG);
+        NET_EBPF_EXT_BAIL_ON_ALLOC_FAILURE_RESULT(redirect_context, "redirect_context", status);
+        if (original_context->family == AF_INET) {
+            redirect_context->original_remote_ip4 = original_context->user_ip4;
+        } else {
+            memcpy(
+                redirect_context->original_remote_ip6, original_context->user_ip6, sizeof(original_context->user_ip6));
+        }
+        redirect_context->original_remote_port = original_context->user_port;
+        redirect_context->transport_endpoint_handle = transport_endpoint_handle;
+        connect_request->localRedirectContext = redirect_context;
+        connect_request->localRedirectContextSize = sizeof(bpf_redirect_context_t);
     }
 
 Exit:
     if (commit_layer_data) {
         FwpsApplyModifiedLayerData(classify_handle, connect_request, 0);
+        // Ownership of the redirect_context is passed to the WFP platform
+        redirect_context = NULL;
+    }
+    if (redirect_context) {
+        ExFreePool(redirect_context);
     }
 
     NET_EBPF_EXT_RETURN_NTSTATUS(status);
@@ -1345,6 +1367,7 @@ net_ebpf_extension_sock_addr_redirect_connection_classify(
     bool classify_handle_acquired = FALSE;
     bool redirected = FALSE;
     net_ebpf_extension_connection_context_t* blocked_connection_context = NULL;
+    uint64_t transport_endpoint_handle = 0;
 
     UNREFERENCED_PARAMETER(layer_data);
     UNREFERENCED_PARAMETER(flow_context);
@@ -1434,6 +1457,10 @@ net_ebpf_extension_sock_addr_redirect_connection_classify(
         incoming_fixed_values, incoming_metadata_values, &net_ebpf_sock_addr_ctx);
     memcpy(&sock_addr_ctx_original, sock_addr_ctx, sizeof(sock_addr_ctx_original));
 
+    if (FWPS_IS_METADATA_FIELD_PRESENT(incoming_metadata_values, FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE)) {
+        transport_endpoint_handle = incoming_metadata_values->transportEndpointHandle;
+    }
+
     v4_mapped = (sock_addr_ctx->family == AF_INET6) && IN6_IS_ADDR_V4MAPPED((IN6_ADDR*)sock_addr_ctx->user_ip6);
 
     // Check if the eBPF program should be invoked based on the IP address family and the hook attach type.
@@ -1494,6 +1521,7 @@ net_ebpf_extension_sock_addr_redirect_connection_classify(
             filter,
             classify_handle,
             redirect_handle,
+            transport_endpoint_handle,
             &redirected,
             classify_output);
         NET_EBPF_EXT_BAIL_ON_ERROR_STATUS(status);
