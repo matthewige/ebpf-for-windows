@@ -21,6 +21,7 @@
 #include "socket_tests_common.h"
 #include "watchdog.h"
 
+#include <iostream>
 #include <mstcpip.h>
 #include <ntsecapi.h>
 
@@ -49,6 +50,14 @@ typedef enum _protocol_type
     UDP,
     CONNECTED_UDP
 } protocol_type_t;
+
+typedef enum _dual_stack_type
+{
+    None,
+    OriginalAddress,
+    RedirectedAddress,
+    Both
+} dual_stack_type_t;
 
 typedef struct _test_addresses
 {
@@ -348,7 +357,9 @@ _update_policy_map(
     destination_entry_t key = {0};
     destination_entry_t value = {0};
 
-    if (_globals.family == AF_INET && dual_stack) {
+    // if (_globals.family == AF_INET && dual_stack) {
+    std::string operation = add ? "add" : "delete";
+    if (dual_stack) {
         struct sockaddr_in6* v6_destination = (struct sockaddr_in6*)&destination;
         struct sockaddr_in6* v6_proxy = (struct sockaddr_in6*)&proxy;
 
@@ -356,9 +367,16 @@ _update_policy_map(
             AF_INET6, (PUCHAR)&key.destination_ip, IN6_GET_ADDR_V4MAPPED((IN6_ADDR*)&v6_destination->sin6_addr));
         INET_SET_ADDRESS(
             AF_INET6, (PUCHAR)&value.destination_ip, IN6_GET_ADDR_V4MAPPED((IN6_ADDR*)&v6_proxy->sin6_addr));
+        const auto dest_string = get_string_from_address((sockaddr*)v6_destination);
+        const auto proxy_string = get_string_from_address((sockaddr*)v6_proxy);
+        std::cout << operation << " entry (dual stack). dest: " << dest_string << " proxy: " << proxy_string
+                  << std::endl;
     } else {
         INET_SET_ADDRESS(_globals.family, (PUCHAR)&key.destination_ip, INETADDR_ADDRESS((PSOCKADDR)&destination));
         INET_SET_ADDRESS(_globals.family, (PUCHAR)&value.destination_ip, INETADDR_ADDRESS((PSOCKADDR)&proxy));
+        const auto dest_string = get_string_from_address((sockaddr*)&destination);
+        const auto proxy_string = get_string_from_address((sockaddr*)&proxy);
+        std::cout << operation << " entry dest: " << dest_string << " proxy: " << proxy_string << std::endl;
     }
 
     key.destination_port = htons(destination_port);
@@ -373,7 +391,7 @@ _update_policy_map(
 }
 
 void
-connect_redirect_test(
+update_policy_map_and_test_connection(
     _In_ client_socket_t* sender_socket,
     _Inout_ sockaddr_storage& destination,
     _In_ const sockaddr_storage& proxy,
@@ -457,7 +475,7 @@ authorize_test(_In_ client_socket_t* sender_socket, _Inout_ sockaddr_storage& de
     _validate_audit_map_entry(authentication_id);
 
     // Now update the policy map to allow the connection and test again.
-    connect_redirect_test(
+    update_policy_map_and_test_connection(
         sender_socket, destination, destination, _globals.destination_port, _globals.destination_port, dual_stack);
 }
 
@@ -499,13 +517,23 @@ connect_redirect_test_wrapper(
     _In_ const sockaddr_storage& source_address,
     _Inout_ sockaddr_storage& destination,
     _In_ const sockaddr_storage& proxy,
-    bool dual_stack)
+    dual_stack_type_t dual_stack)
 {
     client_socket_t* sender_socket = nullptr;
+    bool client_dual_stack =
+        ((dual_stack == dual_stack_type_t::Both) || (dual_stack == dual_stack_type_t::OriginalAddress));
+    bool redirect_dual_stack =
+        ((dual_stack == dual_stack_type_t::Both) || (dual_stack == dual_stack_type_t::RedirectedAddress));
 
-    get_client_socket(dual_stack, &sender_socket, source_address);
-    connect_redirect_test(
-        sender_socket, destination, proxy, _globals.destination_port, _globals.proxy_port, dual_stack);
+    const auto dest_string = get_string_from_address((sockaddr*)&destination);
+    const auto proxy_string = get_string_from_address((sockaddr*)&proxy);
+
+    std::cout << "dest: " << dest_string << " proxy: " << proxy_string << std::endl;
+
+    get_client_socket(client_dual_stack, &sender_socket, source_address);
+    // Update the policy map with the redirection and test the connection.
+    update_policy_map_and_test_connection(
+        sender_socket, destination, proxy, _globals.destination_port, _globals.proxy_port, redirect_dual_stack);
     delete sender_socket;
 }
 
@@ -537,12 +565,12 @@ DECLARE_CONNECTION_AUTHORIZATION_TEST_FUNCTION(local_address)
 // connection_authorization_tests_remote_address
 DECLARE_CONNECTION_AUTHORIZATION_TEST_FUNCTION(remote_address)
 
-#define DECLARE_CONNECTION_AUTHORIZATION_V4_TEST_CASE(                                                    \
-    socket_family_name, socket_family_type, dual_stack, protocol, destination)                            \
-    TEST_CASE(socket_family_name "_" #destination "_" #protocol, "[connect_authorize_redirect_tests_v4]") \
-    {                                                                                                     \
-        connection_authorization_tests_##destination##(                                                   \
-            AF_INET, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);                 \
+#define DECLARE_CONNECTION_AUTHORIZATION_V4_TEST_CASE(                                           \
+    socket_family_name, socket_family_type, dual_stack, protocol, destination)                   \
+    TEST_CASE(socket_family_name "_" #destination "_" #protocol, "[connect_authorize_tests_v4]") \
+    {                                                                                            \
+        connection_authorization_tests_##destination##(                                          \
+            AF_INET, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);        \
     }
 
 #define DECLARE_CONNECTION_AUTHORIZATION_V4_TEST_GROUP(socket_family_name, socket_family_type, dual_stack, protocol) \
@@ -553,12 +581,12 @@ DECLARE_CONNECTION_AUTHORIZATION_TEST_FUNCTION(remote_address)
     DECLARE_CONNECTION_AUTHORIZATION_V4_TEST_CASE(                                                                   \
         socket_family_name, socket_family_type, dual_stack, protocol, remote_address)
 
-#define DECLARE_CONNECTION_AUTHORIZATION_V6_TEST_CASE(                                                    \
-    socket_family_name, socket_family_type, dual_stack, protocol, destination)                            \
-    TEST_CASE(socket_family_name "_" #destination "_" #protocol, "[connect_authorize_redirect_tests_v6]") \
-    {                                                                                                     \
-        connection_authorization_tests_##destination##(                                                   \
-            AF_INET6, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);                \
+#define DECLARE_CONNECTION_AUTHORIZATION_V6_TEST_CASE(                                           \
+    socket_family_name, socket_family_type, dual_stack, protocol, destination)                   \
+    TEST_CASE(socket_family_name "_" #destination "_" #protocol, "[connect_authorize_tests_v6]") \
+    {                                                                                            \
+        connection_authorization_tests_##destination##(                                          \
+            AF_INET6, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);       \
     }
 
 #define DECLARE_CONNECTION_AUTHORIZATION_V6_TEST_GROUP(socket_family_name, socket_family_type, dual_stack, protocol) \
@@ -609,7 +637,10 @@ DECLARE_CONNECTION_AUTHORIZATION_V6_TEST_GROUP("dual_ipv6", socket_family_t::IPv
 
 #define DECLARE_CONNECTION_REDIRECTION_TEST_FUNCTION(source, original_destination, new_destination)                  \
     void connection_redirection_tests_##original_destination##_##new_destination##(                                  \
-        ADDRESS_FAMILY family, protocol_type_t protocol, bool dual_stack, _In_ test_addresses_t& addresses)          \
+        ADDRESS_FAMILY family,                                                                                       \
+        protocol_type_t protocol,                                                                                    \
+        dual_stack_type_t dual_stack,                                                                                \
+        _In_ test_addresses_t & addresses)                                                                           \
     {                                                                                                                \
         _initialize_test_globals();                                                                                  \
         _globals.family = family;                                                                                    \
@@ -618,7 +649,11 @@ DECLARE_CONNECTION_AUTHORIZATION_V6_TEST_GROUP("dual_ipv6", socket_family_t::IPv
                                           ? "TCP"                                                                    \
                                           : ((_globals.protocol == protocol_type_t::UDP) ? "UDP" : "CONNECTED_UDP"); \
         const char* family_string = (_globals.family == AF_INET) ? "IPv4" : "IPv6";                                  \
-        const char* dual_stack_string = dual_stack ? "Dual Stack" : "No Dual Stack";                                 \
+        const char* dual_stack_string =                                                                              \
+            (dual_stack == dual_stack_type_t::Both)                ? "Dual Stack"                                    \
+            : (dual_stack == dual_stack_type_t::OriginalAddress)   ? "Dual Stack (Original Only)"                    \
+            : (dual_stack == dual_stack_type_t::RedirectedAddress) ? "Dual Stack (Redirected Only)"                  \
+                                                                   : "No Dual Stack";                                \
         printf(                                                                                                      \
             "REDIRECT: " #original_destination " -> " #new_destination " | %s | %s | %s\n",                          \
             protocol_string,                                                                                         \
@@ -656,7 +691,7 @@ DECLARE_CONNECTION_REDIRECTION_TEST_FUNCTION(loopback_address, local_address, lo
     socket_family_name, socket_family_type, dual_stack, protocol, original_destination, new_destination) \
     TEST_CASE(                                                                                           \
         socket_family_name "_" #original_destination "_" #new_destination "_" #protocol,                 \
-        "[connect_authorize_redirect_tests_v4]")                                                         \
+        "[connect_redirect_tests_v4]")                                                                   \
     {                                                                                                    \
         connection_redirection_tests_##original_destination##_##new_destination##(                       \
             AF_INET, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);                \
@@ -682,7 +717,7 @@ DECLARE_CONNECTION_REDIRECTION_TEST_FUNCTION(loopback_address, local_address, lo
     socket_family_name, socket_family_type, dual_stack, protocol, original_destination, new_destination) \
     TEST_CASE(                                                                                           \
         socket_family_name "_" #original_destination "_" #new_destination "_" #protocol,                 \
-        "[connect_authorize_redirect_tests_v6]")                                                         \
+        "[connect_redirect_tests_v6]")                                                                   \
     {                                                                                                    \
         connection_redirection_tests_##original_destination##_##new_destination##(                       \
             AF_INET6, protocol, (dual_stack), _globals.addresses[##socket_family_type##]);               \
@@ -707,40 +742,76 @@ DECLARE_CONNECTION_REDIRECTION_TEST_FUNCTION(loopback_address, local_address, lo
 // Connection redirection test cases.
 
 // IPv4, TCP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("ipv4", socket_family_t::IPv4, false, protocol_type_t::TCP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "ipv4", socket_family_t::IPv4, dual_stack_type_t::None, protocol_type_t::TCP)
 
 // IPv4, UDP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("ipv4", socket_family_t::IPv4, false, protocol_type_t::UDP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "ipv4", socket_family_t::IPv4, dual_stack_type_t::None, protocol_type_t::UDP)
 
 // IPv4, CONNECTED_UDP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("ipv4", socket_family_t::IPv4, false, protocol_type_t::CONNECTED_UDP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "ipv4", socket_family_t::IPv4, dual_stack_type_t::None, protocol_type_t::CONNECTED_UDP)
+
+// IPv4 redirect to IPv4 mapped, IPv4, TCP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_to_v4_mapped", socket_family_t::IPv4, dual_stack_type_t::RedirectedAddress, protocol_type_t::TCP)
+
+// IPv4 redirect to IPv4 mapped, IPv4, UDP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_to_v4_mapped", socket_family_t::IPv4, dual_stack_type_t::RedirectedAddress, protocol_type_t::UDP)
+
+// IPv4 redirect to IPv4 mapped, IPv4, CONNECTED_UDP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_to_v4_mapped", socket_family_t::IPv4, dual_stack_type_t::RedirectedAddress, protocol_type_t::CONNECTED_UDP)
 
 // Dual stack socket, IPv4, TCP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("v4_mapped", socket_family_t::Dual, true, protocol_type_t::TCP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped", socket_family_t::Dual, dual_stack_type_t::Both, protocol_type_t::TCP)
 
 // Dual stack socket, IPv4, UDP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("v4_mapped", socket_family_t::Dual, true, protocol_type_t::UDP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped", socket_family_t::Dual, dual_stack_type_t::Both, protocol_type_t::UDP)
 
 // Dual stack socket, IPv4, CONNECTED_UDP
-DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP("v4_mapped", socket_family_t::Dual, true, protocol_type_t::CONNECTED_UDP)
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped", socket_family_t::Dual, dual_stack_type_t::Both, protocol_type_t::CONNECTED_UDP)
+
+// Dual stack socket redirect to IPv4, IPv4, TCP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped_to_v4", socket_family_t::Dual, dual_stack_type_t::OriginalAddress, protocol_type_t::TCP)
+
+// Dual stack socket redirect to IPv4, IPv4, UDP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped_to_v4", socket_family_t::Dual, dual_stack_type_t::OriginalAddress, protocol_type_t::UDP)
+
+// Dual stack socket redirect to IPv4, IPv4, CONNECTED_UDP
+DECLARE_CONNECTION_REDIRECTION_V4_TEST_GROUP(
+    "v4_mapped_to_v4", socket_family_t::Dual, dual_stack_type_t::OriginalAddress, protocol_type_t::CONNECTED_UDP)
 
 // IPv6, TCP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("ipv6", socket_family_t::IPv6, false, protocol_type_t::TCP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "ipv6", socket_family_t::IPv6, dual_stack_type_t::None, protocol_type_t::TCP)
 
 // IPv6, UDP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("ipv6", socket_family_t::IPv6, false, protocol_type_t::UDP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "ipv6", socket_family_t::IPv6, dual_stack_type_t::None, protocol_type_t::UDP)
 
 // IPv6, CONNECTED_UDP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("ipv6", socket_family_t::IPv6, false, protocol_type_t::CONNECTED_UDP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "ipv6", socket_family_t::IPv6, dual_stack_type_t::None, protocol_type_t::CONNECTED_UDP)
 
 // Dual stack socket, IPv6, TCP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("dual_ipv6", socket_family_t::IPv6, true, protocol_type_t::TCP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "dual_ipv6", socket_family_t::IPv6, dual_stack_type_t::Both, protocol_type_t::TCP)
 
 // Dual stack socket, IPv6, UDP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("dual_ipv6", socket_family_t::IPv6, true, protocol_type_t::UDP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "dual_ipv6", socket_family_t::IPv6, dual_stack_type_t::Both, protocol_type_t::UDP)
 
 // Dual stack socket, IPv6, CONNECTED_UDP
-DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP("dual_ipv6", socket_family_t::IPv6, true, protocol_type_t::CONNECTED_UDP)
+DECLARE_CONNECTION_REDIRECTION_V6_TEST_GROUP(
+    "dual_ipv6", socket_family_t::IPv6, dual_stack_type_t::Both, protocol_type_t::CONNECTED_UDP)
 
 int
 main(int argc, char* argv[])
