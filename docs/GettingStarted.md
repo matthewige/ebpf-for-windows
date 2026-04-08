@@ -21,7 +21,7 @@ The following must be installed in order to build this project:
    
 Visual Studio will [prompt you to install](https://learn.microsoft.com/en-us/visualstudio/install/import-export-installation-configurations?view=vs-2019#use-a-configuration-file-to-automatically-install-missing-components) the necessary dependencies when opening the main solution file for the
 first time.
-1. Install [Clang for Windows 64-bit](https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.4/LLVM-19.1.4-win64.exe) (version **19.1.4**). The latest version of clang that ships with the Visual Studio installer does not support `bpf` as a target.
+1. Install [Clang for Windows 64-bit](https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe) (version **18.1.8**). The latest version of clang that ships with the Visual Studio installer does not support `bpf` as a target.
 
 You should add the paths to `git.exe`, `cmake.exe` and `nuget.exe` to the Windows PATH environment variable after the software packages
  above have been installed.
@@ -214,7 +214,7 @@ On a defender machine with [eBPF installed](#installing-ebpf-for-windows), do th
 1. Install and set up a DNS server.
 1. Make sure that either test signing was enabled as discussed in
    [Installing eBPF for Windows](#installing-ebpf-for-windows), or the kernel debugger (KD) is attached and running.
-1. Install [clang](https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.4/LLVM-19.1.4-win64.exe)
+1. Install [clang](https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe)
    if not already installed on the defender machine.
 1. Copy `droppacket.c` and `ebpf.h` to a folder (such as `c:\test`).
 

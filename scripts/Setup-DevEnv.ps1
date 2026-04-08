@@ -12,6 +12,6 @@ echo "Adding required components to Visual Studio"
 Invoke-WebRequest 'https://raw.githubusercontent.com/microsoft/ebpf-for-windows/main/.vsconfig' -OutFile $env:TEMP\ebpf-for-windows.vsconfig
 & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify --installpath "$env:ProgramFiles\Microsoft Visual Studio\2022\Community" --config "$env:TEMP\ebpf-for-windows.vsconfig" --passive
 
-choco install llvm --version=19.1.4 -y
+choco install llvm --version=18.1.8 -y
 choco install nuget.commandline --version 6.4.0 -y
 choco install cmake.portable --version 3.25.1 -y
