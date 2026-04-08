@@ -203,14 +203,17 @@ jobs:
 
       - name: Check for Clang version (MSVC)
         if: steps.skip_check.outputs.should_skip != 'true'
-        run:
+        run: |
           clang.exe --version
+          Write-Host "--- Supported targets ---"
+          clang.exe -print-targets
 
       - name: Check for Clang version (LLVM)
         if: steps.skip_check.outputs.should_skip != 'true'
-        shell: cmd
-        run:
-          '"C:\Program Files\LLVM\bin\clang.exe" --version'
+        run: |
+          & "C:\Program Files\LLVM\bin\clang.exe" --version
+          Write-Host "--- Supported targets ---"
+          & "C:\Program Files\LLVM\bin\clang.exe" -print-targets
 
       - name: Cache nuget packages
         if: steps.skip_check.outputs.should_skip != 'true'
