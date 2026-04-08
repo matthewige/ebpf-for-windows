@@ -81,7 +81,7 @@ See [docs/DevelopmentGuide.md](../docs/DevelopmentGuide.md) for full details. Ke
 - **Structs**: `typedef struct _ebpf_widget { ... } ebpf_widget_t;`
 - **Types**: Use `stdint.h` fixed-width types (`uint32_t`, not `int`)
 - **Headers**: `#pragma once`, local includes before system includes, alphabetized
-- **Formatting**: clang-format 18.1.8, 120-char limit, braces required on single-line blocks
+- **Formatting**: clang-format 19.1.4, 120-char limit, braces required on single-line blocks
 - **License header** (required):
   ```c
   // Copyright (c) eBPF for Windows contributors
