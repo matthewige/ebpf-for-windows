@@ -178,6 +178,11 @@ jobs:
           }
           Write-Host "Hash verification passed"
 
+      - name: Add Visual Studio LLVM to path
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          echo "$env:VCINSTALLDIR\tools\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install LLVM 19.1.4
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
@@ -190,15 +195,11 @@ jobs:
           if (Test-Path "$installDir\bin\clang.exe") {
             $version = & "$installDir\bin\clang.exe" --version | Select-Object -First 1
             Write-Host "Successfully installed: $version"
+            # Add after VS LLVM so installed LLVM (with BPF target) takes priority on PATH.
             echo "$installDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           } else {
             throw "LLVM installation failed - clang.exe not found"
           }
-
-      - name: Add Visual Studio LLVM to path
-        if: steps.skip_check.outputs.should_skip != 'true'
-        run: |
-          echo "$env:VCINSTALLDIR\tools\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Check for Clang version (MSVC)
         if: steps.skip_check.outputs.should_skip != 'true'
