@@ -17,7 +17,7 @@
 - [Multiple attached programs and PEND](#multiple-attached-programs-and-pend)
 - [WFP implementation requirements](#wfp-implementation-requirements)
 - [Per-layer async design](#per-layer-async-design)
-  - [AUTH_CONNECT / AUTH_RECV_ACCEPT](#auth_connect-auth_recv_accept)
+  - [AUTH_CONNECT / AUTH_RECV_ACCEPT](#auth_connect--auth_recv_accept)
   - [AUTH_LISTEN](#auth_listen-layer)
   - [RESOURCE_ASSIGNMENT (Bind)](#resource_assignment-bind-layer)
   - [DATAGRAM_DATA](#datagram_data-layer)
@@ -535,7 +535,7 @@ At pend time, the extension must save a copy of the eBPF program
 context (e.g., `bpf_sock_addr_t`) in the internal tracking state.
 The program context is constructed from the WFP classify parameters
 (fixed values, metadata, layer data), which are stack-based and only
-valid during the original `classifyFn` call -- once the pend API is
+valid during the original `classifyFn` call -- once the pend API
 is called and the callback returns, they are gone. The saved program
 context allows the extension to re-invoke the program for CONTINUE
 without needing the original WFP parameters.
@@ -742,7 +742,7 @@ sequenceDiagram
 ### 1. Stale pended operations (COMPLETE never arrives)
 
 A pended operation may never be completed for various reasons: the
-the async orchestrator crashes, is unavailable, or
+async orchestrator crashes, is unavailable, or
 simply takes too long to respond. In all cases, the pend map entry
 remains and the WFP operation stays pended indefinitely.
 
@@ -1210,19 +1210,23 @@ reach a verdict.
 #### PEND (both directions)
 
 Inside `net_ebpf_ext_pend_operation()` the helper creates a pend
-map entry, clones the NBL via `FwpsAllocateCloneNetBufferList`, and
-calls `FwpsPendClassify()` (the DATAGRAM_DATA equivalent of
-`FwpsPendOperation()`). Unlike authorization layers, multiple
-packets per flow can be outstanding simultaneously (keyed by
-distinct pend IDs). The cloned NBL is stored in the pend context.
-For **outbound**, the pend context additionally captures
+map entry and clones the NBL via `FwpsAllocateCloneNetBufferList`.
+For DATAGRAM_DATA, this is an internal deferred-processing record
+only; it does **not** use the WFP pend/complete API pair
+(`FwpsPendOperation()` / `FwpsCompleteOperation()`), and it does
+**not** call `FwpsPendClassify()`. Unlike authorization layers,
+multiple packets per flow can be outstanding simultaneously (keyed
+by distinct pend IDs). The cloned NBL is stored in the pend
+context. For **outbound**, the pend context additionally captures
 `endpointHandle`, `compartmentId`, and `remoteScopeId` (needed for
 `FwpsInjectTransportSendAsync`).
 
 After `pend()` returns success and the program returns PEND, the
 classify wrapper returns `FWP_ACTION_BLOCK` with
 `FWPS_CLASSIFY_OUT_FLAG_ABSORB` -- WFP silently consumes the
-original packet.
+original packet. Any later PERMIT/COMPLETE path for DATAGRAM_DATA
+is implemented by reinjecting the cloned NBL, not by completing a
+WFP pended classify operation.
 
 #### PERMIT completion
 
