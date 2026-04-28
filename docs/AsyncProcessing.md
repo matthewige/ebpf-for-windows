@@ -68,6 +68,10 @@ netebpfext itself.
    completion latency. See [Edge case 1: Stale pended operations](#1-stale-pended-operations-complete-never-arrives).
 3. The CONTINUE verdict must re-invoke the eBPF program so it can
    resume evaluation from where it left off.
+   Re-invocation is asynchronous on a worker thread at PASSIVE_LEVEL
+   (not synchronous inside the COMPLETE call) and is not pinned to
+   the original `classifyFn` CPU. See [CONTINUE flow](#continue-flow)
+   for the full sequence.
 4. The pend/complete mechanism must be fully encapsulated within
    netebpfext -- eBPF programs and async orchestrators interact only through
    maps and helper functions; no WFP-specific details leak to callers.
