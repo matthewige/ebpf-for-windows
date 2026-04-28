@@ -62,6 +62,10 @@ netebpfext itself.
    pend the current network operation and return control to WFP.
 2. An external async orchestrator must be able to complete the pended operation
    with a verdict (PERMIT, BLOCK, or CONTINUE) at a later time.
+   Bounding "later" is the orchestrator's responsibility -- the
+   extension provides backstops (per-entry stale-entry watchdog and a
+   bounded `max_entries` map) but does not guarantee an upper bound on
+   completion latency. See [Edge case 1: Stale pended operations](#1-stale-pended-operations-complete-never-arrives).
 3. The CONTINUE verdict must re-invoke the eBPF program so it can
    resume evaluation from where it left off.
 4. The pend/complete mechanism must be fully encapsulated within
