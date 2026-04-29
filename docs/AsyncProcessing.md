@@ -1562,8 +1562,10 @@ typedef struct _net_ebpf_ext_pend_internal_state {
             UINT64 endpoint_handle;
             UINT8 remote_address[16];
             SCOPE_ID remote_scope_id;
-            WSACMSGHDR* control_data;
-            ULONG control_data_length;
+            WSACMSGHDR* control_data;       // Deep-copied into extension-owned storage at pend time;
+                                            // do not store a pointer to classify-time memory (which
+                                            // is not guaranteed valid after classifyFn returns).
+            ULONG control_data_length;      // Size in bytes of the extension-owned buffer.
         } connect;
 
         struct {  // AUTH_RECV_ACCEPT (inbound) -- FwpsPendOperation path
