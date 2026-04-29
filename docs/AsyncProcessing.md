@@ -123,13 +123,29 @@ The design leverages the
 [custom map](https://github.com/microsoft/ebpf-for-windows/pull/4882)
 feature. Custom maps allow an eBPF extension to register as an NMR
 provider for a custom map type and intercept CRUD operations on map
-entries. The extension's callbacks are invoked **synchronously** and
-**serialized per map** (ebpfcore acquires a per-map lock before invoking
-the extension's callback) -- when the eBPF program inserts into the map,
-the extension's `process_map_add_element` callback runs inline before
-the call returns. Similarly, when a user-mode process updates or
-deletes a map entry (via `bpf_map_update_elem` / `bpf_map_delete_elem`),
-the extension's callbacks are invoked synchronously through ebpfcore.
+entries.
+
+Two distinct paths invoke the extension's callbacks:
+
+1. **User-mode CRUD via `bpf_map_*` syscalls.** When the async
+   orchestrator calls `bpf_map_update_elem` or `bpf_map_delete_elem`
+   on a pend map entry, ebpfcore dispatches synchronously through
+   the custom map provider's dispatch table to the extension's
+   `preprocess_map_update_element` / `preprocess_map_delete_element`
+   callbacks. (Lookups go through `postprocess_map_find_element`.)
+   `bpf_map_update_elem` covers both insert and replace semantics.
+   These callbacks run **synchronously** and **serialized per map**
+   (ebpfcore acquires a per-map lock before invoking the callback).
+   This path uses **existing** custom map provider machinery.
+2. **Extension-initiated kernel-mode CRUD from the `pend()` helper
+   and from the threaded DPC.** Insertion of a new pend entry, the
+   COMPLETE-side lookup, and the post-completion delete are all
+   driven by netebpfext directly (kernel mode, outside an eBPF helper
+   call) -- not by the eBPF program calling `bpf_map_update_elem`.
+   The program's only path into the map is via the `pend()` extension
+   helper. This path requires **new ebpfcore APIs** (kernel-mode
+   entry points exposed to providers) that do not exist today; see
+   [ebpfcore platform requirements](#ebpfcore-platform-requirements).
 
 This provides a data communication mechanism between netebpfext (which
 implements pend/complete semantics via the layer-specific WFP async APIs)
@@ -146,7 +162,7 @@ and issues a verdict once finished).
 
 The extension exposes one helper function:
 
-- **`net_ebpf_ext_pend_operation()`** -- called by the eBPF program to
+- **`bpf_pend_operation()`** -- called by the eBPF program to
   pend the current classify. It generates an opaque key, populates
   the map entry, **records the current CPU number (`classifyfn_cpu`)
   for later DPC dispatch, and synchronously invokes the
@@ -168,16 +184,19 @@ The program calls `pend()` to insert a map entry, pend the WFP
 operation, and receive an opaque key. **Only after `pend()` returns
 success** does the program notify the async orchestrator (e.g., via
 a BTF-resolved function or a shared map), passing the opaque key so
-the async orchestrator can issue a COMPLETE later. This ordering --
-WFP pend before notification -- structurally closes the
-"COMPLETE-arrives-before-pend" race: the orchestrator cannot learn
-the key until the WFP operation is already pended. If notification
-fails, the program returns a non-PEND verdict; netebpfext synthesizes
-the COMPLETE path (queues a threaded DPC on the recorded
-`classifyfn_cpu` to invoke `FwpsCompleteOperation` after `classifyFn`
-unwinds). The same synthesized-completion path runs if the program
-returns a non-PEND verdict for any other reason after a successful
-`pend()`.
+the async orchestrator can issue a COMPLETE later.
+
+This ordering -- WFP pend before notification -- structurally closes
+the "COMPLETE-arrives-before-pend" race; see
+[Race A](#race-a-complete-arrives-before-the-wfp-pend-api-is-called)
+for the full argument.
+
+If notification fails (or the program returns a non-PEND verdict for
+any other reason after a successful `pend()`), netebpfext synthesizes
+the COMPLETE path from the same threaded-DPC machinery used by the
+orchestrator-driven COMPLETE; see
+[Notification fails](#notification-fails) and
+[PEND flow](#pend-flow) for the mechanism.
 
 ### Map key and value structures
 
@@ -192,7 +211,7 @@ versions without breaking backward compatibility.
 
 ```c
 // Opaque key structure -- callers must not interpret or construct these fields.
-// The extension populates this via net_ebpf_ext_pend_operation() and returns it to the caller.
+// The extension populates this via bpf_pend_operation() and returns it to the caller.
 // Versioned using the standard ebpf_extension_header_t pattern (see ebpf_windows.h).
 typedef struct _net_ebpf_ext_pend_key {
     ebpf_extension_header_t header;     // Version/size header for forward compatibility
@@ -203,7 +222,7 @@ typedef struct _net_ebpf_ext_pend_key {
 #### Map value
 The map value has a **minimum prefix** defined by the extension: a
 single `action` field that the extension reads to distinguish a new
-PEND insertion from a COMPLETE update (PERMIT/BLOCK). Callers may
+PEND insertion from a COMPLETE update (PERMIT_SOFT/PERMIT_HARD/BLOCK). Callers may
 declare a larger value type with additional fields after this prefix --
 the extension only accesses the prefix. The extension also appends its
 own internal tracking fields (WFP layer ID, lifecycle state) after
@@ -212,10 +231,11 @@ these are not visible to callers on lookups.
 
 ```c
 typedef enum _net_ebpf_ext_pend_action {
-    NET_EBPF_EXT_PEND_ACTION_PENDING = 0,   // Operation is pended, awaiting orchestrator decision
-    NET_EBPF_EXT_PEND_ACTION_PERMIT = 1,    // Orchestrator verdict: permit
-    NET_EBPF_EXT_PEND_ACTION_BLOCK = 2,     // Orchestrator verdict: block
-    NET_EBPF_EXT_PEND_ACTION_CONTINUE = 3,  // Orchestrator verdict: re-invoke program to continue evaluation
+    NET_EBPF_EXT_PEND_ACTION_PENDING       = 0,  // Operation is pended, awaiting orchestrator decision
+    NET_EBPF_EXT_PEND_ACTION_PERMIT_SOFT   = 1,  // Orchestrator verdict: soft permit (other filters can still BLOCK)
+    NET_EBPF_EXT_PEND_ACTION_PERMIT_HARD   = 2,  // Orchestrator verdict: hard permit (overrides remaining filters at this layer)
+    NET_EBPF_EXT_PEND_ACTION_BLOCK         = 3,  // Orchestrator verdict: block (maps to hard block in WFP, matching BPF_SOCK_ADDR_VERDICT_REJECT)
+    NET_EBPF_EXT_PEND_ACTION_CONTINUE      = 4,  // Orchestrator verdict: re-invoke program to continue evaluation
 } net_ebpf_ext_pend_action_t;
 
 // Minimum value prefix required by the extension.
@@ -226,6 +246,15 @@ typedef struct _net_ebpf_ext_pend_value {
     net_ebpf_ext_pend_action_t action;  // Set to PENDING by pend; read by extension on COMPLETE/CONTINUE
 } net_ebpf_ext_pend_value_t;
 ```
+
+> **Verdict mapping.** `PERMIT_SOFT` and `PERMIT_HARD` map to the
+> same WFP outcomes as `BPF_SOCK_ADDR_VERDICT_PROCEED_SOFT` and
+> `BPF_SOCK_ADDR_VERDICT_PROCEED_HARD` would when returned
+> synchronously by a sock_addr program. `BLOCK` maps to a hard
+> block (matching `BPF_SOCK_ADDR_VERDICT_REJECT`); the eBPF API
+> does not expose a soft-block variant. Other layers that do not
+> distinguish soft/hard permit (e.g., RESOURCE_ASSIGNMENT) treat
+> both `PERMIT_SOFT` and `PERMIT_HARD` as a plain permit.
 
 #### Map type
 ```c
@@ -245,7 +274,7 @@ typedef struct _net_ebpf_ext_pend_value {
 // rolled back and a negative error code is returned; the caller
 // should return a non-PEND verdict.
 // Returns: 0 on success, negative error code on failure.
-int net_ebpf_ext_pend_operation(_In_ void* pend_map,
+int bpf_pend_operation(_In_ void* pend_map,
                                _In_reads_bytes_(value_size) void* value,
                                uint32_t value_size,
                                _Inout_updates_bytes_(key_size) void* key,
@@ -266,7 +295,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_NET_EBPF_EXT_PEND);
     __type(key, net_ebpf_ext_pend_key_t);
     __type(value, my_pend_map_value_t);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 1024);  // Illustrative. This is a hard cap on concurrent pends:
+                                // ebpfcore backs the custom map with a hash table whose bucket
+                                // array is pre-sized to max_entries, so the value also drives
+                                // resident memory cost. Pick a value that covers worst-case
+                                // concurrent pends for the orchestrator's workload (and
+                                // consider exposing it as a tunable).
 } pend_map SEC(".maps");
 
 // ... in program logic:
@@ -276,7 +310,7 @@ my_pend_map_value_t value = {};
 value.orchestrator_context = /* orchestrator-defined identifier */;
 value.timestamp = bpf_ktime_get_boot_ns();
 
-int err = net_ebpf_ext_pend_operation(&pend_map, &value, sizeof(value), &opaque_key, sizeof(opaque_key));
+int err = bpf_pend_operation(&pend_map, &value, sizeof(value), &opaque_key, sizeof(opaque_key));
 if (err != 0) {
     // pend() failed (e.g., FwpsPendOperation returned an error).
     // The map entry has been rolled back; return a non-PEND verdict.
@@ -298,7 +332,7 @@ if (notify_result != 0) {
     return BPF_SOCK_ADDR_VERDICT_REJECT;
 }
 
-return BPF_SOCK_ADDR_VERDICT_PEND;
+return BPF_SOCK_ADDR_VERDICT_PEND;  // New verdict added by this proposal -- see ebpf_nethooks.h work item.
 ```
 
 ## PEND flow
@@ -309,7 +343,7 @@ return BPF_SOCK_ADDR_VERDICT_PEND;
 3. When the eBPF program determines that the current operation needs
    to be pended:
     1. The program populates the caller-visible value, then calls
-       `net_ebpf_ext_pend_operation(&pend_map, &value, sizeof(value), &opaque_key, sizeof(opaque_key))`
+       `bpf_pend_operation(&pend_map, &value, sizeof(value), &opaque_key, sizeof(opaque_key))`
        -- an extension helper function exposed by netebpfext. The
        extension generates a unique key (monotonic counter), sets
        `action = PENDING` in the value prefix, appends internal
@@ -368,7 +402,7 @@ sequenceDiagram
     ebpfcore->>bpfprog: Execute program
     bpfprog->>bpfprog: Process rules, determine pend needed
 
-    bpfprog->>ebpfext: net_ebpf_ext_pend_operation(&pend_map,<br/>&value, sizeof(value),<br/>&opaque_key, sizeof(opaque_key))<br/>(extension helper)
+    bpfprog->>ebpfext: bpf_pend_operation(&pend_map,<br/>&value, sizeof(value),<br/>&opaque_key, sizeof(opaque_key))<br/>(extension helper)
     ebpfext->>ebpfext: Generate key, insert map entry,<br/>record classifyFn CPU
     ebpfext->>tcpip: FwpsPendOperation(completionHandle)<br/>(layer-specific pend API)
     tcpip-->>ebpfext: Success + completionContext
@@ -388,7 +422,7 @@ sequenceDiagram
 > **Important:** The layer-specific completion API (e.g.,
 > `FwpsCompleteOperation()`) is **only** invoked from a **threaded
 > DPC** queued onto the recorded `classifyfn_cpu`. The DPC is
-> queued from the `process_map_delete_element` callback when the
+> queued from the `preprocess_map_delete_element` callback when the
 > orchestrator calls `bpf_map_delete_elem`; netebpfext does not
 > initiate completion on its own. From the orchestrator's
 > perspective, `bpf_map_delete_elem` returns success once the DPC is
@@ -403,35 +437,26 @@ sequenceDiagram
 > time: the orchestrator owns direct verdict handling; the extension
 > owns terminal completion after CONTINUE re-invocation.
 
-> **Why a threaded DPC on `classifyfn_cpu`?** WFP holds an internal
-> classify-side reference on the auth context for the duration of
-> the original `classifyFn`. If `FwpsCompleteOperation()` is invoked
-> while that reference is still held -- including on the same CPU
-> while `classifyFn` is unwinding -- the refcount drops `2 -> 1`,
-> not `2 -> 0`, and the completion action does not fire. Queueing a
-> threaded DPC targeted at the recorded `classifyfn_cpu` guarantees
-> the DPC cannot run until that CPU has unwound `classifyFn` and
-> WFP's classify-side cleanup has released its reference. By the
-> time the DPC runs, the refcount is exactly 1 and
-> `FwpsCompleteOperation()` drops it to 0, firing the completion
-> action inline on the DPC thread.
+> **Why a threaded DPC on `classifyfn_cpu`?** See
+> [Race B](#race-b-in-classifyfn-fwpscompleteoperation-drops-auth-context-refcount-2---1)
+> for the full refcount analysis.
 
 1. The async orchestrator makes its decision (asynchronously) and
    prepares to deliver the verdict.
-2. For **PERMIT or BLOCK**, the async orchestrator uses the opaque
+2. For **PERMIT_SOFT, PERMIT_HARD, or BLOCK**, the async orchestrator uses the opaque
    pend key and performs two map operations:
    1. **Update verdict**: Call `bpf_map_update_elem` with `BPF_EXIST`
       to write the verdict (permit/block/continue) into the entry's
-      `action` field. The extension's `process_map_add_element`
-      callback validates that the action is `PERMIT`, `BLOCK`, or
-      `CONTINUE` (not `PENDING`). For PERMIT/BLOCK, this stores the
+      `action` field. The extension's `preprocess_map_update_element`
+      callback validates that the action is `PERMIT_SOFT`, `PERMIT_HARD`, `BLOCK`, or
+      `CONTINUE` (not `PENDING`). For PERMIT_SOFT/PERMIT_HARD/BLOCK, this stores the
       verdict for the subsequent delete. For CONTINUE, the extension
       queues a work item to re-invoke the program (see
       [CONTINUE flow](#continue-flow)). If the entry does not exist
       (e.g., the stale-entry timeout removed it),
       `bpf_map_update_elem` returns an error.
    2. **Delete entry**: Call `bpf_map_delete_elem` with the same key.
-      The extension's `process_map_delete_element` callback reads the
+      The extension's `preprocess_map_delete_element` callback reads the
       stored verdict from the `action` field, marks the entry
       "completion pending", and **queues a threaded DPC targeted at
       the recorded `classifyfn_cpu`**. The DPC fires after that CPU
@@ -450,10 +475,10 @@ sequenceDiagram
    threaded-DPC dispatch.
 
 > **CPU hot-unplug fallback.** If the recorded `classifyfn_cpu` is
-> no longer online when the DPC is queued, the extension falls back
-> to a generic worker thread for completion. The race protection
-> argument still holds because, by the time the CPU went offline,
-> any in-progress `classifyFn` on it had to have unwound.
+> offline at DPC-queue time, netebpfext falls back to a generic
+> worker thread; see
+> [Race B](#race-b-in-classifyfn-fwpscompleteoperation-drops-auth-context-refcount-2---1)
+> for why the race protection still holds.
 
 The following diagram illustrates the COMPLETE flow for the
 AUTH_CONNECT and AUTH_RECV_ACCEPT layers. Other layers use different
@@ -466,15 +491,15 @@ sequenceDiagram
     participant ebpfext as netebpfext.sys
     participant tcpip as tcpip.sys
 
-    orchestrator->>orchestrator: Build pend map value<br/>with verdict (permit/block)
+    orchestrator->>orchestrator: Build pend map value<br/>with verdict (PERMIT_SOFT/PERMIT_HARD/BLOCK)
     orchestrator->>ebpfcore: bpf_map_update_elem(&pend_map,<br/>&opaque_key, &value, BPF_EXIST)
-    ebpfcore->>ebpfext: process_map_add_element callback
-    ebpfext->>ebpfext: Validate action is PERMIT or BLOCK
+    ebpfcore->>ebpfext: preprocess_map_update_element callback
+    ebpfext->>ebpfext: Validate action is PERMIT_SOFT, PERMIT_HARD, or BLOCK
     ebpfext-->>ebpfcore: Return success
     ebpfcore-->>orchestrator: Map update success (verdict stored)
 
     orchestrator->>ebpfcore: bpf_map_delete_elem(&pend_map,<br/>&opaque_key)
-    ebpfcore->>ebpfext: process_map_delete_element callback
+    ebpfcore->>ebpfext: preprocess_map_delete_element callback
 
     alt Entry found (normal COMPLETE)
         ebpfext->>ebpfext: Read stored verdict,<br/>verify not already completed,<br/>mark "completion pending"
@@ -492,13 +517,13 @@ sequenceDiagram
             ebpfext->>ebpfext: Read verdict from pending<br/>completion context (keyed by thread)
             ebpfext-->>tcpip: Return stored verdict<br/>(FWP_ACTION_PERMIT or FWP_ACTION_BLOCK)
             Note over tcpip,ebpfext: FwpsCompleteOperation returns
-            alt PERMIT
+            alt PERMIT_SOFT or PERMIT_HARD
                 ebpfext->>tcpip: FwpsInjectTransportSendAsync(clonedNbl)
             else BLOCK
                 ebpfext->>ebpfext: Free cloned NBL
             end
 
-        else RECV_ACCEPT (inbound) -- PERMIT
+        else RECV_ACCEPT (inbound) -- PERMIT_SOFT or PERMIT_HARD
             ebpfext->>tcpip: FwpsCompleteOperation(completionContext, NULL)<br/>(completes authorization)
             ebpfext->>tcpip: FwpsInjectTransportReceiveAsync(clonedNbl)
 
@@ -583,7 +608,7 @@ struct {
 
 1. The async orchestrator responds with CONTINUE and calls
    `bpf_map_update_elem` with `action = CONTINUE` on the pend map
-   entry. The extension's `process_map_add_element` callback validates
+   entry. The extension's `preprocess_map_update_element` callback validates
    the action and records the CONTINUE request.
 2. The extension detects the CONTINUE action and queues a work item
    (the callback runs under the per-map lock -- re-invocation cannot
@@ -621,7 +646,7 @@ struct {
      pend API again.
 
 > **Note:** On CONTINUE re-invocation, the program must **not** call
-> `net_ebpf_ext_pend_operation()` again -- the existing pend map
+> `bpf_pend_operation()` again -- the existing pend map
 > entry is still valid. netebpfext also must not call the WFP pend
 > API again, since the WFP operation is already pended
 > (`FwpsPendOperation` cannot be called during reauthorization, and
@@ -640,7 +665,7 @@ sequenceDiagram
     Note over orchestrator: Orchestrator decides: CONTINUE<br/>(resume program evaluation)
 
     orchestrator->>ebpfcore: bpf_map_update_elem(&pend_map,<br/>&opaque_key, &value{action=CONTINUE}, BPF_EXIST)
-    ebpfcore->>ebpfext: process_map_add_element callback
+    ebpfcore->>ebpfext: preprocess_map_update_element callback
     ebpfext->>ebpfext: Validate CONTINUE action,<br/>reset action to PENDING,<br/>queue work item
     ebpfext-->>ebpfcore: Return success
     ebpfcore-->>orchestrator: Map update success
@@ -660,7 +685,7 @@ sequenceDiagram
         ebpfcore-->>ebpfext: Return verdict
         ebpfext->>ebpfext: Classify wrapper reads verdict,<br/>performs map update + delete<br/>(same completion path as COMPLETE flow)
         Note over ebpfext: Same completion path as<br/>normal COMPLETE flow
-        ebpfext->>ebpfext: process_map_delete_element:<br/>queue threaded DPC on recorded<br/>classifyFn CPU
+        ebpfext->>ebpfext: preprocess_map_delete_element:<br/>queue threaded DPC on recorded<br/>classifyFn CPU
         Note over ebpfext: DPC fires, runs layer-specific completion<br/>+ reinject/free; entry removed
 
     else Program needs to pend again (re-PEND)
@@ -686,6 +711,16 @@ stores the verdict, marks the entry "completion pending", and queues
 a threaded DPC on the recorded `classifyfn_cpu` to invoke the WFP
 completion API after `classifyFn` unwinds.
 
+> netebpfext locates the entry without needing additional WFP
+> context: when `bpf_pend_operation()` was invoked from inside the
+> classifyFn, the classify wrapper recorded the opaque key (and the
+> classifyFn-local state needed to complete -- recorded CPU,
+> completion context, layer parameters) in its on-stack
+> per-classify state. After the program returns, the wrapper
+> inspects that recorded state -- if a `pend()` was issued and the
+> verdict is non-PEND, it already has the key in hand to drive the
+> synthesized COMPLETE.
+
 ```mermaid
 sequenceDiagram
     participant tcpip as tcpip.sys
@@ -700,7 +735,7 @@ sequenceDiagram
     orchestrator-->>bpfprog: Return error
 
     Note over bpfprog: Notification failed -- abort the pend<br/>by returning a non-PEND verdict
-    bpfprog-->>ebpfcore: Return REJECT (or PERMIT) verdict
+    bpfprog-->>ebpfcore: Return REJECT verdict
     ebpfcore-->>ebpfext: Return verdict
 
     Note over ebpfext: Synthesized COMPLETE path<br/>(non-PEND verdict after successful pend())
@@ -713,10 +748,24 @@ sequenceDiagram
     Note over ebpfext: Pend cleanly terminated;<br/>orchestrator never saw the opaque key
 ```
 
+> **Why route extension-internal completion through
+> `bpf_map_delete_elem` / `preprocess_map_delete_element` instead
+> of calling the WFP completion API directly from netebpfext?**
+> Every completion trigger (orchestrator-driven
+> `bpf_map_delete_elem`, this synthesized COMPLETE path,
+> CONTINUE→final verdict, expiration/drain) lands in the same
+> `preprocess_map_delete_element` callback. Unifying on a single
+> completion implementation avoids forking parallel code paths,
+> gets per-map lock serialization for free from ebpfcore, and
+> keeps every entry leaving the map through one observable
+> chokepoint. The cost is a same-thread function-pointer dispatch
+> through ebpfcore -- no thread switch and no extra lock beyond
+> the per-map lock that would have been acquired anyway.
+
 ### Pend API fails inside pend() helper
 
 This failure happens synchronously inside
-`net_ebpf_ext_pend_operation()`, *before* any notification is
+`bpf_pend_operation()`, *before* any notification is
 dispatched. The helper rolls back the map entry and returns an error
 to the program; the program then returns a non-PEND verdict. The
 orchestrator never learned an opaque key, so there is no
@@ -729,7 +778,7 @@ sequenceDiagram
     participant ebpfext as netebpfext.sys
     participant bpfprog as eBPF Program
 
-    bpfprog->>ebpfext: net_ebpf_ext_pend_operation(...)
+    bpfprog->>ebpfext: bpf_pend_operation(...)
     ebpfext->>ebpfext: Generate key, insert map entry,<br/>record classifyFn CPU
     ebpfext->>tcpip: FwpsPendOperation(completionHandle)
     tcpip-->>ebpfext: Failure
@@ -761,7 +810,7 @@ The async orchestrator runs a periodic timer that enumerates pend map entries an
 entries that have exceeded an age threshold (using a `timestamp` field
 in the caller-visible value, set by the eBPF program at pend time). For
 each expired entry, the process calls `bpf_map_delete_elem` -- the
-extension's `process_map_delete_element` callback defaults to BLOCK when
+extension's `preprocess_map_delete_element` callback defaults to BLOCK when
 no verdict is stored (`action = PENDING`), and performs layer-dependent
 completion (see [Per-layer async design](#per-layer-async-design)).
 This is the primary cleanup mechanism for stale entries.
@@ -772,7 +821,7 @@ this (via its own IPC mechanism) and enumerates the pend map entries,
 identifies entries belonging to that sub-component (using an orchestrator-defined
 field in the caller-visible value), and issues `bpf_map_delete_elem`
 for each. Since the entry's `action` field is still `PENDING` (no
-verdict was set), the extension's `process_map_delete_element` callback
+verdict was set), the extension's `preprocess_map_delete_element` callback
 defaults to BLOCK and performs layer-dependent completion accordingly.
 
 **c) Async orchestrator crash (no active cleanup possible):**
@@ -788,14 +837,14 @@ shutdown), the async orchestrator must first drain all pending
 operations. The process enumerates the pend map, sets the `action`
 field to the desired verdict via `bpf_map_update_elem`, and then issues
 `bpf_map_delete_elem` for each entry -- triggering the normal COMPLETE
-flow via `process_map_delete_element`. Only after all pending entries
+flow via `preprocess_map_delete_element`. Only after all pending entries
 have been drained should the process proceed with program unload.
 
 > **Important: WFP pend state leak prevention.** Every pended entry
 > **must** eventually have the layer-appropriate completion API called
 > -- otherwise WFP state leaks and operations hang indefinitely.
 > netebpfext guarantees that the correct completion API is called for
-> every `process_map_delete_element` invocation where the entry has
+> every `preprocess_map_delete_element` invocation where the entry has
 > `lifecycle_state == PENDED`. However, netebpfext does **not**
 > initiate map deletes on its own -- all cleanup is driven by the
 > async orchestrator via the mechanisms above (age-based timer,
@@ -809,7 +858,7 @@ expected order. Two key scenarios:
 
 **a) Entry removed via unexpected delete:**
 Since `bpf_map_delete_elem` now triggers completion in
-the `process_map_delete_element` callback, most unintended deletions are
+the `preprocess_map_delete_element` callback, most unintended deletions are
 safe -- the extension defaults to BLOCK when no verdict is stored
 (`action = PENDING`). However, some edge cases remain:
 - The stale-entry timer (item #1 above) races with a legitimate
@@ -828,7 +877,7 @@ removed it), so the process receives an error -- no risk of calling
 the completion API twice.
 
 ### 3. Program returns non-PEND verdict after calling pend()
-If the eBPF program calls `net_ebpf_ext_pend_operation()` (which
+If the eBPF program calls `bpf_pend_operation()` (which
 inserts the map entry and synchronously calls the WFP pend API)
 successfully, but then returns a non-PEND verdict (e.g., because
 notification failed), the map entry exists and the WFP operation is
@@ -888,12 +937,12 @@ See [Appendix: Internal state struct](#appendix-internal-state-struct)
 for the full struct definition.
 
 The lifecycle of the internal state:
-- **Created** when `net_ebpf_ext_pend_operation()` inserts the map
+- **Created** when `bpf_pend_operation()` inserts the map
   entry and the WFP pend API succeeds. `lifecycle_state` is set to
   `PENDED`. All per-layer fields (e.g., `completion_context`,
   cloned NBL) and `classifyfn_cpu` are populated before the helper
   returns.
-- **Updated** when `process_map_delete_element` reads the verdict
+- **Updated** when `preprocess_map_delete_element` reads the verdict
   and queues the threaded DPC. `lifecycle_state` becomes
   `COMPLETION_PENDING`.
 - **Removed** by the threaded DPC after the layer-dependent
@@ -913,10 +962,10 @@ not result in a second WFP completion.
 **For stale operations:** See
 [Edge case 1](#1-stale-pended-operations-complete-never-arrives) --
 the orchestrator's cleanup paths issue `bpf_map_delete_elem`, which
-triggers `process_map_delete_element` with a default BLOCK verdict.
+triggers `preprocess_map_delete_element` with a default BLOCK verdict.
 
-**For lifecycle edge cases:** The `process_map_delete_element` and
-`process_map_add_element` callbacks enforce the invariant -- see
+**For lifecycle edge cases:** The `preprocess_map_delete_element` and
+`preprocess_map_update_element` callbacks enforce the invariant -- see
 [COMPLETE flow](#complete-flow) and [CONTINUE flow](#continue-flow)
 for the callback logic.
 
@@ -1009,6 +1058,12 @@ must be persisted and retrieved.
 Programs after the PEND program never run for that operation. This is
 consistent with the existing early-exit model -- the PEND program
 effectively claims the final decision for the operation.
+
+> **Diagnostic trace.** When netebpfext skips one or more subsequent
+> programs in the chain due to a prior PEND, it will emit a trace
+> event identifying the skipped program(s) and the PEND-er, so
+> operators can diagnose why a given program was not invoked for a
+> particular operation.
 
 ## WFP implementation requirements
 
@@ -1166,7 +1221,7 @@ a classify handle, rather than `FwpsPendOperation` /
    to the program.
 
 2. **PERMIT.** From the threaded DPC queued by
-   `process_map_delete_element`, netebpfext calls
+   `preprocess_map_delete_element`, netebpfext calls
    `FwpsCompleteClassify(classifyHandle, 0, &classifyOut)` with
    `classifyOut.actionType = FWP_ACTION_PERMIT`, then
    `FwpsReleaseClassifyHandle(classifyHandle)`. The verdict is
@@ -1217,7 +1272,7 @@ reach a verdict.
 
 #### PEND (both directions)
 
-Inside `net_ebpf_ext_pend_operation()` the helper creates a pend
+Inside `bpf_pend_operation()` the helper creates a pend
 map entry and clones the NBL via `FwpsAllocateCloneNetBufferList`.
 For DATAGRAM_DATA, this is an internal deferred-processing record
 only; it does **not** use the WFP pend/complete API pair
@@ -1238,7 +1293,7 @@ WFP pended classify operation.
 
 #### PERMIT completion
 
-From the threaded DPC queued by `process_map_delete_element` (on
+From the threaded DPC queued by `preprocess_map_delete_element` (on
 the recorded `classifyfn_cpu`), netebpfext reinjects the cloned
 packet using the direction-specific API:
 `FwpsInjectTransportReceiveAsync` (inbound) or
@@ -1271,7 +1326,7 @@ arrive and are classified independently.
   an error synchronously, the completion callback does **not**
   fire -- free the cloned NBL inline. Guard against double-free.
 - **Direction in pend context**: Record direction at absorb time so
-  `process_map_delete_element` calls the correct reinject API.
+  `preprocess_map_delete_element` calls the correct reinject API.
 
 ### STREAM layer
 
@@ -1385,20 +1440,37 @@ The following changes to ebpfcore are required to support this design:
 1. **Custom map type registration**
    - Add the `BPF_MAP_TYPE_NET_EBPF_EXT_PEND` enum value to
      `ebpf_map_type_t` in `ebpf_structs.h`.
+   - Add the `BPF_SOCK_ADDR_VERDICT_PEND` enum value to
+     `ebpf_sock_addr_verdict_t` in `ebpf_nethooks.h`. This is a new
+     program return verdict introduced by this proposal; netebpfext
+     interprets it as "operation absorbed and held until the
+     orchestrator issues a COMPLETE." The corresponding WFP outcome
+     is layer-specific (see [Per-layer async design](#per-layer-async-design)).
 2. **Custom map operation callbacks** *(extends existing lookup-only support to full CRUD)*
-   - **User-mode callbacks:** Add `process_map_add_element` and
-     `process_map_delete_element` callbacks for user-mode operations.
-     The COMPLETE path uses `bpf_map_update_elem` to store the verdict
-     and `bpf_map_delete_elem` to trigger WFP completion via the
-     extension's callbacks.
-   - **Extension-initiated operations:** Add support for create, read,
-     update, and delete from kernel mode, outside an eBPF helper call.
-     Required for: inserting entries with full pend context populated
-     (in the `pend()` helper, after a successful WFP pend API call),
-     reading entries (in `complete()` and CONTINUE), and deleting
-     entries (rollback on `FwpsPendOperation()` failure inside the
-     helper, synthesized COMPLETE for non-PEND verdict after `pend()`,
-     post-completion cleanup from the threaded DPC).
+   - **User-mode / orchestrator-driven callbacks (existing
+     dispatch-table machinery):** The custom map provider already
+     exposes `preprocess_map_update_element`,
+     `preprocess_map_delete_element`, and
+     `postprocess_map_find_element`. For this map type,
+     `bpf_map_update_elem` covers both insert and replace semantics,
+     so no separate add callback is needed. The COMPLETE path uses
+     `bpf_map_update_elem` to store the verdict and `bpf_map_delete_elem`
+     to trigger WFP completion via these callbacks.
+   - **Extension-initiated kernel-mode operations (new APIs
+     required):** ebpfcore must expose kernel-mode entry points that
+     allow a custom map provider to perform CRUD on its own map from
+     kernel mode -- outside the normal eBPF helper or user-mode map
+     operation path. These APIs do not exist today and must be added.
+     They must take the per-map lock and route through the same
+     dispatch-table callbacks as the user-mode path (so that all
+     state transitions remain serialized and observable by the
+     provider). Required for: inserting entries with full pend
+     context populated (in the `pend()` helper, after a successful
+     WFP pend API call), reading entries (in COMPLETE and CONTINUE
+     processing), and deleting entries (rollback on
+     `FwpsPendOperation()` failure inside the helper, synthesized
+     COMPLETE for a non-PEND verdict after `pend()`, post-completion
+     cleanup from the threaded DPC).
 3. **Namespace isolation**
    - Ensure custom maps support namespace isolation
      ([PR #4424](https://github.com/microsoft/ebpf-for-windows/pull/4424))
@@ -1419,10 +1491,12 @@ The following changes to ebpfcore are required to support this design:
 
 1. **Custom map provider for the pend map** -- register as an NMR
    provider for the Map Information NPI with extension-controlled
-   value size and `process_map_create`, `process_map_add_element`,
-   and `process_map_delete_element` callbacks.
+   value size and the dispatch-table callbacks
+   `preprocess_map_update_element` and `preprocess_map_delete_element`
+   (insert/replace and delete) plus `postprocess_map_find_element` for
+   lookups.
 2. **Extension helper functions** --
-   `net_ebpf_ext_pend_operation()` (all layers). Inserts the map
+   `bpf_pend_operation()` (all layers). Inserts the map
    entry, records `classifyfn_cpu` via
    `KeGetCurrentProcessorNumberEx`, synchronously invokes the
    layer-specific WFP pend API, and rolls back on failure.
@@ -1451,6 +1525,16 @@ tracking fields that netebpfext appends after the caller-visible map
 value. It is not exposed to eBPF programs or orchestrator code --
 the extension controls the actual stored value size, and lookups
 return only the caller-visible portion.
+
+> **Memory ownership note:** Any metadata captured here for use by
+> a later program re-invocation (CONTINUE) or by the WFP completion
+> path must be backed by extension-owned storage with a lifetime
+> that outlives the original `classifyFn`. Pointers to buffers
+> provided by WFP/TCPIP (e.g., `inMetaValues` fields, control data,
+> NBL contents) are only valid while the original `classifyFn` is
+> on the stack and **must be deep-copied** (or otherwise rehydrated
+> from a stable source) before being stored in the entry. The same
+> rule applies to any future fields added to this struct.
 
 ```c
 // Lifecycle state for a pend map entry.
